@@ -1,0 +1,28 @@
+CREATE TABLE IF NOT EXISTS brands (
+  id SERIAL PRIMARY KEY,
+  name VARCHAR(64) NOT NULL UNIQUE
+);
+
+CREATE TABLE IF NOT EXISTS regions (
+  id SERIAL PRIMARY KEY,
+  name VARCHAR(128) NOT NULL UNIQUE,
+  yandex_id INT NULL
+);
+
+CREATE TABLE IF NOT EXISTS phrases (
+  id SERIAL PRIMARY KEY,
+  template VARCHAR(128) NOT NULL UNIQUE
+);
+
+CREATE TABLE IF NOT EXISTS stats (
+  id BIGSERIAL PRIMARY KEY,
+  region VARCHAR(128) NOT NULL,
+  brand VARCHAR(64) NOT NULL,
+  query VARCHAR(256) NOT NULL,
+  query_count INT NOT NULL,
+  created_at TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_stats_region ON stats(region);
+CREATE INDEX IF NOT EXISTS idx_stats_brand ON stats(brand);
+CREATE INDEX IF NOT EXISTS idx_stats_created_at ON stats(created_at);

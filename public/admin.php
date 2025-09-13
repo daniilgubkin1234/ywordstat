@@ -1,0 +1,222 @@
+<?php
+declare(strict_types=1);
+mb_internal_encoding('UTF-8');
+
+require_once __DIR__ . '/../src/config.php';
+require_auth();
+
+$pdo = db();
+
+function build_url(array $extra = []): string {
+    $base = strtok($_SERVER['REQUEST_URI'], '?');
+    $q    = array_merge($_GET, $extra);
+    foreach ($q as $k => $v) if ($v === '' || $v === null) unset($q[$k]);
+    return $base . ($q ? ('?' . http_build_query($q)) : '');
+}
+
+$brand    = trim((string)($_GET['brand']   ?? ''));
+$region   = trim((string)($_GET['region']  ?? ''));
+$q        = trim((string)($_GET['q']       ?? ''));  
+$page     = max(1, (int)($_GET['page']     ?? 1));
+$perPage  = (int)($_GET['per_page'] ?? 20);
+if ($perPage < 10)  $perPage = 10;
+if ($perPage > 100) $perPage = 100;
+$offset = ($page - 1) * $perPage;
+
+$brands  = $pdo->query("SELECT name FROM brands ORDER BY name")->fetchAll(PDO::FETCH_COLUMN) ?: [];
+$regions = $pdo->query("SELECT name FROM regions ORDER BY name")->fetchAll(PDO::FETCH_COLUMN) ?: [];
+
+$where  = [];
+$params = [];
+if ($brand !== '')  { $where[] = 'brand = :brand';     $params[':brand']  = $brand; }
+if ($region !== '') { $where[] = 'region = :region';   $params[':region'] = $region; }
+if ($q !== '')      { $where[] = 'query ILIKE :q';     $params[':q']      = '%'.$q.'%'; }
+$whereSql = $where ? ('WHERE ' . implode(' AND ', $where)) : '';
+
+$stmt = $pdo->prepare("SELECT COUNT(*) FROM stats $whereSql");
+$stmt->execute($params);
+$totalRows  = (int)$stmt->fetchColumn();
+$totalPages = max(1, (int)ceil($totalRows / $perPage));
+if ($page > $totalPages) $page = $totalPages;
+$offset = ($page - 1) * $perPage;
+
+$sql = "SELECT region, brand, query, query_count, created_at
+        FROM stats
+        $whereSql
+        ORDER BY created_at DESC, id DESC
+        LIMIT $perPage OFFSET $offset";
+$stmt = $pdo->prepare($sql);
+$stmt->execute($params);
+$stats = $stmt->fetchAll(PDO::FETCH_ASSOC) ?: [];
+
+$lastRunRaw = (string)($pdo->query("SELECT MAX(created_at) FROM stats")->fetchColumn() ?: '');
+$lastRun = '—';
+if ($lastRunRaw !== '') {
+  $d = DateTime::createFromFormat('Y-m-d H:i:s.u', $lastRunRaw) ?: new DateTime($lastRunRaw);
+  $lastRun = $d->format('d.m.Y H:i');
+}
+?>
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <title>Админка — Я.Вордстат</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="stylesheet" href="<?= asset_url('assets/admin.css') ?>">
+</head>
+<body>
+<div class="wrap">
+  <div class="card">
+
+    <div class="cap">
+      <div><strong>Админка — Я.Вордстат</strong></div>
+      <div class="right">
+        <button class="btn" id="btnCollect" type="button" title="Собрать статистику">
+          <svg aria-hidden="true" viewBox="0 0 24 24" width="16" height="16"
+               fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M3 12a9 9 0 0 1 15.36-6.36"/>
+            <path d="M18 3v5h-5"/>
+            <path d="M21 12a9 9 0 0 1-15.36 6.36"/>
+            <path d="M6 21v-5h5"/>
+          </svg>
+          <span>Собрать статистику</span>
+        </button>
+
+        <a class="btn" id="btnExport"
+           href="<?= '/export.php' . (empty($_GET) ? '' : '?' . http_build_query($_GET)) ?>"
+           title="Экспортировать текущую выборку">
+          <svg aria-hidden="true" viewBox="0 0 24 24" width="16" height="16"
+               fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+            <polyline points="14 2 14 8 20 8"/>
+            <path d="M12 12v5"/>
+            <path d="M9.5 14.5L12 17l2.5-2.5"/>
+          </svg>
+          <span>Экспорт в Excel</span>
+        </a>
+
+        <a class="btn" href="/logout.php" title="Выйти">
+          <svg aria-hidden="true" viewBox="0 0 24 24" width="16" height="16"
+               fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/>
+            <path d="M16 17l5-5-5-5"/>
+            <path d="M21 12H9"/>
+          </svg>
+          <span>Выйти</span>
+        </a>
+      </div>
+    </div>
+
+    <div class="prog"><div class="bar" id="bar"></div></div>
+    <div id="status" class="muted" style="margin-top:6px">Готов к работе</div>
+
+    <div class="muted" style="margin-top:6px;">
+      Последний сбор статистики был произведён:
+      <b id="lastRun"><?= htmlspecialchars($lastRun) ?></b>
+    </div>
+
+    <form method="get" class="row filters">
+      <div class="control">
+        <div class="muted" style="font-size:12px;">Бренд</div>
+        <select name="brand" style="min-width:180px">
+          <option value="">— все бренды —</option>
+          <?php foreach ($brands as $b): ?>
+            <option value="<?= htmlspecialchars($b) ?>" <?= $b===$brand ? 'selected' : '' ?>>
+              <?= htmlspecialchars($b) ?>
+            </option>
+          <?php endforeach; ?>
+        </select>
+      </div>
+
+      <div class="control">
+        <div class="muted" style="font-size:12px;">Город / Регион</div>
+        <select name="region" style="min-width:200px">
+          <option value="">— все города —</option>
+          <?php foreach ($regions as $r): ?>
+            <option value="<?= htmlspecialchars($r) ?>" <?= $r===$region ? 'selected' : '' ?>>
+              <?= htmlspecialchars($r) ?>
+            </option>
+          <?php endforeach; ?>
+        </select>
+      </div>
+
+      <div class="control">
+        <div class="muted" style="font-size:12px;">Поиск</div>
+        <input type="text" name="q" value="<?= htmlspecialchars($q) ?>" placeholder="Итоговый запрос…">
+      </div>
+
+      <div class="control">
+        <div class="muted" style="font-size:12px;">На странице</div>
+        <select name="per_page" style="width:120px">
+          <?php foreach ([10,20,50,100] as $pp): ?>
+            <option value="<?= $pp ?>" <?= $pp===$perPage ? 'selected' : '' ?>><?= $pp ?></option>
+          <?php endforeach; ?>
+        </select>
+      </div>
+
+      <div class="actions">
+        <button class="btn" type="submit">Показать</button>
+        <a class="btn" href="<?= strtok($_SERVER['REQUEST_URI'], '?') ?>">Сбросить</a>
+      </div>
+    </form>
+
+    <div class="table-wrap">
+      <table class="table-sticky">
+        <thead>
+          <tr>
+            <th>Регион</th>
+            <th>Бренд</th>
+            <th>Итоговый запрос</th>
+            <th>Кол-во запросов за 30 дней</th>
+            <th>Когда</th>
+          </tr>
+        </thead>
+        <tbody>
+        <?php if (!$stats): ?>
+          <tr><td colspan="5" class="muted">Нет данных под выбранные фильтры.</td></tr>
+        <?php else: foreach ($stats as $row): ?>
+          <tr>
+            <td><?= htmlspecialchars($row['region']) ?></td>
+            <td><?= htmlspecialchars($row['brand']) ?></td>
+            <td><?= htmlspecialchars($row['query']) ?></td>
+            <td><?= (int)$row['query_count'] ?></td>
+            <?php
+              $dtRaw = (string)$row['created_at'];
+              $d = DateTime::createFromFormat('Y-m-d H:i:s.u', $dtRaw) ?: new DateTime($dtRaw);
+              $dtFmt = $d->format('d.m.Y H:i');
+            ?>
+            <td class="muted"><?= htmlspecialchars($dtFmt) ?></td>
+          </tr>
+        <?php endforeach; endif; ?>
+        </tbody>
+      </table>
+    </div>
+
+    <?php if ($totalPages > 1): ?>
+      <nav class="pager">
+        <a class="btn" href="<?= build_url(['page'=>max(1, $page-1)]) ?>"
+           style="<?= $page<=1 ? 'pointer-events:none;opacity:.5;' : '' ?>">« Назад</a>
+        <?php
+          $pages = [1];
+          for ($p=$page-2; $p <= $page+2; $p++) if ($p>1 && $p<$totalPages) $pages[] = $p;
+          if ($totalPages>1) $pages[] = $totalPages;
+          $pages = array_values(array_unique($pages)); sort($pages);
+          $prev = 0;
+          foreach ($pages as $p) {
+            if ($prev && $p > $prev+1) echo '<span class="muted" style="padding:0 4px;">…</span>';
+            $cls = $p===$page ? 'btn active' : 'btn';
+            echo '<a class="'.$cls.'" href="'.htmlspecialchars(build_url(['page'=>$p])).'">'.$p.'</a>';
+            $prev = $p;
+          }
+        ?>
+        <a class="btn" href="<?= build_url(['page'=>min($totalPages, $page+1)]) ?>"
+           style="<?= $page>=$totalPages ? 'pointer-events:none;opacity:.5;' : '' ?>">Вперёд »</a>
+      </nav>
+    <?php endif; ?>
+
+  </div>
+</div>
+
+<script src="<?= asset_url('assets/admin.js') ?>" defer></script>
+</body>
+</html>
