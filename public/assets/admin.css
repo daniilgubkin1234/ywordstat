@@ -41,4 +41,8 @@
    .btn svg{width:16px;height:16px;display:inline-block}
    .filters .control{display:flex;flex-direction:column;gap:4px}
    .filters .actions{display:flex;gap:8px;align-self:flex-end;margin-left:auto}
-   
+   .status.error { color: #b00020; }
+   .status { margin-top:6px; font-size:14px; }
+    .status.error { color:#b00020; }
+    .notice { margin:12px 0; padding:10px 12px; border:1px solid #e1a; border-radius:8px; background:#fff2f6; color:#7a0033; }
+    .pager.is-disabled { pointer-events:none; opacity:.6; }

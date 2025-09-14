@@ -7,19 +7,20 @@ const $export  = document.getElementById('btnExport');
 const $tbody   = document.querySelector('.table-sticky tbody');
 const $lastRun = document.getElementById('lastRun');
 
-function setProgress(done, total, text) {
-  const pct = total > 0 ? Math.round((done * 100) / total) : 0;
-  if ($bar)  $bar.style.width = pct + '%';
-  if ($stat) $stat.textContent = text ?? `${done}/${total}…`;
+const CSRF = document.querySelector('meta[name="csrf-token"]')?.content?.trim() || '';
+
+let collecting = false; 
+
+function setStatus(text, isError = false) {
+  if (!$stat) return;
+  $stat.textContent = text;
+  $stat.classList.toggle('error', !!isError);
 }
 
-function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
-
-async function safeJson(resp) {
-  const ct = resp.headers.get('content-type') || '';
-  const text = await resp.text();
-  try { return ct.includes('application/json') ? JSON.parse(text) : JSON.parse(text); }
-  catch { return null; }
+function setProgress(done, total, text) {
+  const pct = total > 0 ? Math.round((done * 100) / total) : 0;
+  if ($bar) $bar.style.width = pct + '%';
+  setStatus(text ?? `${done}/${total}…`);
 }
 
 function lockUI(lock) {
@@ -34,12 +35,9 @@ function lockUI(lock) {
       }
     });
   }
-  
-  if ($pager) {
-    if (lock) $pager.classList.add('is-disabled');
-    else $pager.classList.remove('is-disabled');
-  }
-  
+
+  if ($pager)  $pager.classList.toggle('is-disabled', !!lock);
+
   if ($export) {
     if (lock) {
       $export.setAttribute('aria-disabled', 'true');
@@ -52,11 +50,59 @@ function lockUI(lock) {
     }
   }
 
-  if ($btn) {
-    $btn.disabled = !!lock;
-  }
+  if ($btn) $btn.disabled = !!lock;
 }
 
+function sleep(ms) {
+  return new Promise(r => setTimeout(r, ms));
+}
+window.addEventListener('error', (e) => {
+  setStatus(`Неожиданная ошибка: ${e.message}`, true);
+  console.error('window.error:', e);
+});
+
+window.addEventListener('unhandledrejection', (e) => {
+  const msg = e.reason?.message || String(e.reason || 'Неизвестная ошибка');
+  setStatus(`Ошибка выполнения: ${msg}`, true);
+  console.error('unhandledrejection:', e.reason);
+});
+
+async function parseJson(resp) {
+  const txt = await resp.text();
+  if (!txt) return null;
+  try { return JSON.parse(txt); } catch { return null; }
+}
+
+async function apiFetch(url, options = {}) {
+  const opts = {
+    method: 'GET',
+    credentials: 'same-origin',
+    headers: { 'Accept': 'application/json' },
+    redirect: 'follow',
+    ...options,
+  };
+  if (opts.method && opts.method.toUpperCase() !== 'GET') {
+    opts.headers['X-CSRF-Token'] = CSRF;
+  }
+
+  let resp;
+  try {
+    resp = await fetch(url, opts);
+  } catch (networkErr) {
+    throw new Error(`[NETWORK] ${networkErr.message || networkErr}`);
+  }
+
+  const data = await parseJson(resp);
+
+  if (!resp.ok || (data && data.ok === false)) {
+    const code = data?.code ? `[${data.code}] ` : '';
+    const msg  = (data?.message || data?.error || `HTTP ${resp.status}`);
+    const rid  = data?.requestId ? ` (requestId: ${data.requestId})` : '';
+    throw new Error(`${code}${msg}${rid}`);
+  }
+
+  return data ?? { ok: true };
+}
 async function refreshTableAndPager() {
   try {
     const url = new URL(window.location.href);
@@ -70,60 +116,70 @@ async function refreshTableAndPager() {
     const newPager = doc.querySelector('nav.pager');
     const newLast  = doc.getElementById('lastRun');
 
-    if (newTbody && $tbody) {
-      $tbody.innerHTML = newTbody.innerHTML;
-    }
+    if (newTbody && $tbody) $tbody.innerHTML = newTbody.innerHTML;
     if ($pager && newPager) {
       $pager.innerHTML = newPager.innerHTML;
-    
       $pager.classList.remove('is-disabled');
     }
-    if ($lastRun && newLast) {                            
-      $lastRun.textContent = newLast.textContent;
-    }
-    if ($stat) $stat.textContent = 'Готово! Данные обновлены.';
+    if ($lastRun && newLast) $lastRun.textContent = newLast.textContent;
+
+    setStatus('Готово! Данные обновлены.');
   } catch (e) {
-    console.error('Не удалось  обновить таблицу, делаю reload:', e);
-    location.reload(); 
+    console.error('Не удалось обновить таблицу, перезагружаю страницу:', e);
+    location.reload();
   }
 }
 
-$btn?.addEventListener('click', async () => {
+async function runCollect() {
+  if (collecting) return; 
+  collecting = true;
+
   try {
     lockUI(true);
     setProgress(0, 0, 'Инициализация…');
 
-    let r = await fetch('/collect.php', { method: 'POST', credentials: 'same-origin' });
-    if (!r.ok) throw new Error('Ошибка инициализации');
-    let init = await safeJson(r);
-    if (!init || init.ok === false) throw new Error(init?.error || 'init');
-
+    const init = await apiFetch('/collect.php', { method: 'POST' });
     const total = Number(init.total ?? 0);
     let done = init.resume ? Number(init.done ?? 0) : 0;
+
+    if (!total || total < 0) {
+      throw new Error('[EMPTY_TOTAL] Нет задач для сбора. Проверьте справочники.');
+    }
     setProgress(done, total, `Обработка ${done}/${total}…`);
 
+    let attempts = 0;
     while (done < total) {
-      const resp = await fetch('/collect.php', { method: 'POST', credentials: 'same-origin' });
-      if (!resp.ok) throw new Error('Сбой шага сбора');
-      const data = await safeJson(resp);
-      if (!data || data.ok === false) throw new Error(data?.error || 'step');
+      try {
+        const data = await apiFetch('/collect.php', { method: 'POST' });
+        done = Number(data.done ?? (done + 1));
+        const tail = data.phrase ? ` — ${data.phrase}` : '';
+        setProgress(done, total, `Обработка ${done}/${total}${tail}`);
+        if (data.finished) break;
 
-      const tail = data.phrase ? ` — ${data.phrase}` : '';
-      done = Number(data.done ?? (done + 1));
-      setProgress(done, total, `Обработка ${done}/${total}${tail}`);
-
-      if (data.finished) break;
-      await sleep(60); 
+        attempts = 0;         
+        await sleep(60);      
+      } catch (stepErr) {
+        attempts++;
+        const delay = Math.min(2000 * attempts, 10000); // 2s, 4s, 6s… до 10s
+        setStatus(`Временная ошибка шага: ${stepErr.message}. Повтор через ${delay/1000} с…`);
+        await sleep(delay);
+        if (attempts >= 5) throw stepErr; 
+      }
     }
-
     if (done >= total) {
       setProgress(total, total, 'Готово! Данные обновляются…');
       await refreshTableAndPager();
     }
   } catch (err) {
-    console.error(err);
-    alert(String(err.message || err));
+    setStatus(String(err.message || err), true);
+    console.error('runCollect fatal:', err);
   } finally {
     lockUI(false);
+    collecting = false;
   }
+}
+
+$btn?.addEventListener('click', (e) => {
+  e.preventDefault();
+  runCollect();
 });
