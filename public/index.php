@@ -20,7 +20,7 @@ ob_start();
 
   <div class="row">
     <label>Логин</label>
-    <input name="login" required autocomplete="username">
+    <input type="text" name="login" required autocomplete="username">
   </div>
 
   <div class="row">
@@ -30,7 +30,6 @@ ob_start();
 
   <div class="row">
     <button class="btn" type="submit">Войти</button>
-    <a class="btn" href="/">На главную</a>
   </div>
 
   <?php if ($err): ?>
